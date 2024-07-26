@@ -73,9 +73,7 @@ float VectorMagSquared(Vector2 v) {
     return v.x * v.x + v.y * v.y;
 }
 
-Vector2 castRay(Vector2 start, float c) {
-    Vector2 u = (Vector2) { cosf(c), -sinf(c) };
-    start = VectorAdd(start, VectorScale(u, 0.01));
+Vector2 castRay(Vector2 start, Vector2 u) {
     float nextx = 0.0;
     float nexty = 0.0;
     if (u.x > 0) {
@@ -100,8 +98,9 @@ Vector2 castRay(Vector2 start, float c) {
     } else {
         float dx = nextx - start.x;
         float dy = start.y - nexty;
-        Vector2 intx = (Vector2) {nextx, start.y - dx * tanf(c)};
-        Vector2 inty = (Vector2) {start.x + dy / tanf(c), nexty};
+        float tanu = -u.y / u.x;
+        Vector2 intx = (Vector2) {nextx, start.y - dx * tanu};
+        Vector2 inty = (Vector2) {start.x + dy / tanu, nexty};
         if ( VectorMagSquared(VectorSub(intx, start)) < VectorMagSquared(VectorSub(inty, start)) ) {
             axisInt = intx;
         } else {
@@ -109,20 +108,33 @@ Vector2 castRay(Vector2 start, float c) {
         }
     }
     if (DEBUG) {
-        printf("start.x = %f start.y = %f angle = %5.2f u.x = %f u.y = %f nextx = %f nexty = %f intx = %f int y = %f\n",
+        printf("start.x = %f start.y = %f u.x = %f u.y = %f nextx = %f nexty = %f intx = %f int y = %f\n",
             start.x, start.y,
-            c * 180.0/PI, u.x, u.y,
+            u.x, u.y,
             nextx, nexty,
             axisInt.x, axisInt.y);
+    }
+    if (VectorMagSquared(VectorSub(axisInt, gameState.player)) < FAR_CLIP*FAR_CLIP) {
+        // nudge the point forward to get it off the current grid line
+        axisInt = VectorAdd(axisInt, VectorScale(u, 0.01));
+        // Check if we are in a wall
+        size_t mapCol = floor(axisInt.x / CELL_SIZE);
+        size_t mapRow = floor(axisInt.y / CELL_SIZE);
+        if (ROOM[mapRow * ROWS + mapCol] != '#') {
+            // not in wall, so continue
+            axisInt = castRay(axisInt, u);
+        }
     }
     return axisInt;
 }
 
 int main(void)
 {
+
     if (DEBUG) {
         for (float c = 0.0; c <= 2*PI; c += 15*PI/180.0) {
-            Vector2 cast = castRay(gameState.player, c);
+            Vector2 u = (Vector2) { cosf(c), -sinf(c) };
+            Vector2 cast = castRay(gameState.player, u);
         }
         return 0;
     }
@@ -198,11 +210,10 @@ int main(void)
             DrawLine(playerPos.x, playerPos.y, p0.x, p0.y, GREEN);
             DrawCircle(p1.x, p1.y, CELL_SIZE / 5, ORANGE);
             DrawCircle(p2.x, p2.y, CELL_SIZE / 5, BLUE);
-            Vector2 cast = playerPos;
-            for (size_t i = 0; i < 10; i++) {
-                cast = castRay(cast, gameState.cameraAngle);
-                DrawCircle(cast.x, cast.y, CELL_SIZE / 5, WHITE);
-            }
+            Vector2 u = (Vector2) { cosf(gameState.cameraAngle), -sinf(gameState.cameraAngle) };
+            Vector2 cast = castRay(gameState.player, u);
+            cast = mapToScreen(cast);
+            DrawCircle(cast.x, cast.y, CELL_SIZE / 5, WHITE);
         EndDrawing();
     }
 
