@@ -149,6 +149,56 @@ float DistanceFromPointToLine(Vector2 point, Vector2 l1, Vector2 l2) {
 }
 
 
+// Project a floor-plane line segment (already decomposed into forward/lateral coords)
+// onto the screen and draw it.  Clips against the near plane before projecting.
+static void DrawFloorLine(float projDist, float fwd1, float lat1, float fwd2, float lat2) {
+    float near = (float)NEAR_CLIP;
+    if (fwd1 < near && fwd2 < near) return;
+    if (fwd1 < near) {
+        float t = (near - fwd1) / (fwd2 - fwd1);
+        lat1 += t * (lat2 - lat1);
+        fwd1  = near;
+    } else if (fwd2 < near) {
+        float t = (near - fwd2) / (fwd1 - fwd2);
+        lat2 += t * (lat1 - lat2);
+        fwd2  = near;
+    }
+    float halfH = CELL_SIZE / 2.0f;
+    int sx1 = (int)(WIDTH  / 2.0f + projDist * lat1 / fwd1);
+    int sy1 = (int)(HEIGHT / 2.0f + projDist * halfH / fwd1);
+    int sx2 = (int)(WIDTH  / 2.0f + projDist * lat2 / fwd2);
+    int sy2 = (int)(HEIGHT / 2.0f + projDist * halfH / fwd2);
+    DrawLine(sx1, sy1, sx2, sy2, WHITE);
+}
+
+// Draw the ROWSxCOLS dungeon grid projected onto the floor plane (height 0).
+// Must be called before wall rendering so walls overdraw the floor lines.
+static void DrawFloorGrid(float projDist) {
+    float ca = cosf(gameState.cameraAngle);
+    float sa = sinf(gameState.cameraAngle);
+    float px = gameState.player.x;
+    float py = gameState.player.y;
+
+    // Horizontal grid lines (constant map-y, spanning full map width)
+    for (int r = 0; r <= (int)ROWS; r++) {
+        float wy  = r * CELL_SIZE;
+        float dy  = wy - py;
+        float dx1 = -px,                    dx2 = COLS * CELL_SIZE - px;
+        float fwd1 = dx1 * ca + dy * (-sa), fwd2 = dx2 * ca + dy * (-sa);
+        float lat1 = dx1 * sa + dy *   ca,  lat2 = dx2 * sa + dy *   ca;
+        DrawFloorLine(projDist, fwd1, lat1, fwd2, lat2);
+    }
+    // Vertical grid lines (constant map-x, spanning full map height)
+    for (int c = 0; c <= (int)COLS; c++) {
+        float wx  = c * CELL_SIZE;
+        float dx  = wx - px;
+        float dy1 = -py,                    dy2 = ROWS * CELL_SIZE - py;
+        float fwd1 = dx * ca + dy1 * (-sa), fwd2 = dx * ca + dy2 * (-sa);
+        float lat1 = dx * sa + dy1 *   ca,  lat2 = dx * sa + dy2 *   ca;
+        DrawFloorLine(projDist, fwd1, lat1, fwd2, lat2);
+    }
+}
+
 void DrawMinimap(Texture2D wall4_texture, float cellScale) {
     // draw minimap
 
@@ -233,8 +283,10 @@ int main(void)
             Vector2 playerPos = mapToScreen((Vector2) {gameState.player.x, gameState.player.y});
             float rectWidth = (float) WIDTH / CAST_STEPS;
             float angStep = FOV / CAST_STEPS;
+            float projDist = (WIDTH / 2.0f) / tanf(FOV / 2.0f);
             // Camera forward direction (unit vector along cameraAngle)
             Vector2 forward = (Vector2){cosf(gameState.cameraAngle), -sinf(gameState.cameraAngle)};
+            DrawFloorGrid(projDist);
             for (int c = 0; c < CAST_STEPS; c++) {
                 float castAngle = gameState.cameraAngle + 0.5f * FOV - c * angStep;
                 Vector2 u = (Vector2) { cosf(castAngle), -sinf(castAngle) };
@@ -244,7 +296,6 @@ int main(void)
                     Vector2 toCast = VectorSub(cast, gameState.player);
                     float distToCast = toCast.x * forward.x + toCast.y * forward.y;
                     if (distToCast > NEAR_CLIP) {
-                        float projDist = (WIDTH / 2.0f) / tanf(FOV / 2.0f);
                         float wallHeight = projDist * CELL_SIZE / distToCast;
                         Vector2 topLeft = { rectWidth * c, 0.5f * HEIGHT - 0.5f * wallHeight };
                         Vector2 size = { rectWidth, wallHeight };
