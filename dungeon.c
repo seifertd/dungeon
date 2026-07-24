@@ -3,32 +3,26 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
-static char * ROOM =
-    "############"
-    "#   #      +"
-    "#   #      #"
-    "#   #    @ #"
-    "#   #      #"
-    "#   #####  #"
-    "#     #    #"
-    "#     #    #"
-    "#  ####    #"
-    "#     #    #"
-    "#          #"
-    "############";
-
 #define DEBUG 0
+#define DEFAULT_MAP "./assets/map.txt"
 
-static const size_t ROWS = 12;
-static const size_t COLS = 12;
+// The dungeon grid, loaded from a text file at startup (see LoadMap).
+static char  *ROOM = NULL;
+static size_t ROWS = 0;
+static size_t COLS = 0;
+
 static const size_t CELL_SIZE = 20;
 static const size_t WIDTH = 1280;
 static const size_t HEIGHT = 760;
 static const float FOV = 100.0 * PI / 180.0;
-static const size_t CAST_STEPS = 100;
-static const size_t FAR_CLIP = ROWS * CELL_SIZE / 2;
+static const size_t CAST_STEPS = WIDTH; // one ray per screen column
+// How far a ray travels before giving up, in world units. Purely a visual
+// choice now (cost is linear and cheap): a CELL_SIZE-tall wall at this range is
+// ~17px tall, small but readable. Raise for longer sightlines in open maps.
+static const size_t FAR_CLIP = 32 * CELL_SIZE;
 static const size_t NEAR_CLIP = 5;
 static const float ROTATION_SPEED = 5.0f;
 static const float MOVE_SPEED = 40.0f;
@@ -41,10 +35,70 @@ typedef struct {
 
 static GameState gameState = {
     .mapPos = {100, 100},
-    .player = {9 * CELL_SIZE + CELL_SIZE / 2,
-               3 * CELL_SIZE + CELL_SIZE / 2},
+    .player = {0, 0}, // set from the map's '@' marker in LoadMap
     .cameraAngle = 0.2,
 };
+
+// Load a dungeon from a text file into ROOM/ROWS/COLS. Each line is one row;
+// the longest line sets COLS and shorter rows are space-padded (space = floor).
+// '#' is wall, '@' marks the player start (stored as floor). Trailing blank
+// lines are ignored. Sets gameState.player to the '@' cell centre if present.
+// Returns false (leaving ROOM NULL) if the file can't be read or is empty.
+bool LoadMap(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "LoadMap: cannot open '%s'\n", path);
+        return false;
+    }
+
+    char  **lines = NULL;
+    size_t  nLines = 0, cap = 0, maxLen = 0;
+    char    buf[4096];
+    while (fgets(buf, sizeof buf, f)) {
+        size_t len = strcspn(buf, "\r\n"); // strip newline
+        buf[len] = '\0';
+        if (nLines == cap) {
+            cap = cap ? cap * 2 : 32;
+            lines = realloc(lines, cap * sizeof *lines);
+        }
+        lines[nLines] = malloc(len + 1);
+        memcpy(lines[nLines], buf, len + 1);
+        if (len > maxLen) maxLen = len;
+        nLines++;
+    }
+    fclose(f);
+
+    // Drop trailing blank lines so a final newline doesn't add an empty row.
+    while (nLines > 0 && lines[nLines - 1][0] == '\0') {
+        free(lines[--nLines]);
+    }
+    if (nLines == 0 || maxLen == 0) {
+        fprintf(stderr, "LoadMap: '%s' is empty\n", path);
+        free(lines);
+        return false;
+    }
+
+    ROWS = nLines;
+    COLS = maxLen;
+    ROOM = malloc(ROWS * COLS);
+    for (size_t r = 0; r < ROWS; r++) {
+        size_t len = strlen(lines[r]);
+        for (size_t c = 0; c < COLS; c++) {
+            char ch = c < len ? lines[r][c] : ' ';
+            if (ch == '@') {
+                gameState.player = (Vector2){
+                    c * CELL_SIZE + CELL_SIZE / 2.0f,
+                    r * CELL_SIZE + CELL_SIZE / 2.0f,
+                };
+                ch = ' '; // player start is floor
+            }
+            ROOM[r * COLS + c] = ch;
+        }
+        free(lines[r]);
+    }
+    free(lines);
+    return true;
+}
 
 Vector2 mapToScreen(Vector2 map) {
     return (Vector2) { gameState.mapPos.x + map.x, gameState.mapPos.y + map.y };
@@ -74,61 +128,47 @@ float VectorMagSquared(Vector2 v) {
     return v.x * v.x + v.y * v.y;
 }
 
+// Walk the grid cell by cell along the ray (DDA) until a wall is hit or FAR_CLIP
+// is passed.  Iterative, and it tracks distance travelled along the ray instead
+// of absolute world coordinates, so precision does not degrade as the player
+// moves away from the map origin.  u must be a unit vector.
 bool castRay(Vector2 start, Vector2 u, Vector2 *axisInt) {
-    float nextx = 0.0;
-    float nexty = 0.0;
-    if (u.x > 0) {
-        nextx = (floorf(start.x / CELL_SIZE) + 1.0f) * CELL_SIZE;
-    } else {
-        nextx = floorf(start.x / CELL_SIZE - 1e-6f) * CELL_SIZE;
-    }
-    if (u.y > 0) {
-        nexty = (floorf(start.y / CELL_SIZE) + 1.0f) * CELL_SIZE;
-    } else {
-        nexty = floorf(start.y / CELL_SIZE - 1e-6f) * CELL_SIZE;
-    }
-    *axisInt = (Vector2) {0};
-    if (fabs(u.y) < 1e-6) {
-        // horizontal
-        axisInt->x = nextx;
-        axisInt->y = start.y;
-    } else if (fabs(u.x) < 1e-6) {
-        // vertical
-        axisInt->y = nexty;
-        axisInt->x = start.x;
-    } else {
-        float dx = nextx - start.x;
-        float dy = start.y - nexty;
-        float tanu = -u.y / u.x;
-        Vector2 intx = (Vector2) {nextx, start.y - dx * tanu};
-        Vector2 inty = (Vector2) {start.x + dy / tanu, nexty};
-        if ( VectorMagSquared(VectorSub(intx, start)) < VectorMagSquared(VectorSub(inty, start)) ) {
-            *axisInt = intx;
-        } else {
-            *axisInt = inty;
+    int mapCol = (int)floorf(start.x / CELL_SIZE);
+    int mapRow = (int)floorf(start.y / CELL_SIZE);
+    int stepX  = u.x < 0 ? -1 : 1;
+    int stepY  = u.y < 0 ? -1 : 1;
+
+    // Distance along the ray between successive grid lines of each axis.
+    float deltaX = fabsf(u.x) < 1e-20f ? INFINITY : fabsf(CELL_SIZE / u.x);
+    float deltaY = fabsf(u.y) < 1e-20f ? INFINITY : fabsf(CELL_SIZE / u.y);
+
+    // Distance along the ray to the first grid line of each axis.
+    float sideX = deltaX == INFINITY ? INFINITY
+        : (u.x < 0 ? start.x - mapCol * (float)CELL_SIZE
+                   : (mapCol + 1) * (float)CELL_SIZE - start.x) * deltaX / CELL_SIZE;
+    float sideY = deltaY == INFINITY ? INFINITY
+        : (u.y < 0 ? start.y - mapRow * (float)CELL_SIZE
+                   : (mapRow + 1) * (float)CELL_SIZE - start.y) * deltaY / CELL_SIZE;
+
+    for (;;) {
+        float dist;
+        if (sideX < sideY) { dist = sideX; sideX += deltaX; mapCol += stepX; }
+        else               { dist = sideY; sideY += deltaY; mapRow += stepY; }
+        if (dist > (float)FAR_CLIP) {
+            return false;
+        }
+        if (mapRow < 0 || mapRow >= (int)ROWS || mapCol < 0 || mapCol >= (int)COLS) {
+            continue; // outside the map reads as open space
+        }
+        if (ROOM[mapRow * COLS + mapCol] == '#') {
+            *axisInt = VectorAdd(start, VectorScale(u, dist));
+            if (DEBUG) {
+                printf("start = (%f,%f) u = (%f,%f) dist = %f hit = (%f,%f)\n",
+                    start.x, start.y, u.x, u.y, dist, axisInt->x, axisInt->y);
+            }
+            return true;
         }
     }
-    if (DEBUG) {
-        printf("start.x = %f start.y = %f u.x = %f u.y = %f nextx = %f nexty = %f intx = %f int y = %f\n",
-            start.x, start.y,
-            u.x, u.y,
-            nextx, nexty,
-            axisInt->x, axisInt->y);
-    }
-    if (VectorMagSquared(VectorSub(*axisInt, gameState.player)) < FAR_CLIP*FAR_CLIP) {
-        // nudge the point forward to get it off the current grid line
-        *axisInt = VectorAdd(*axisInt, VectorScale(u, 0.01));
-        // Check if we are in a wall
-        size_t mapCol = (size_t)floorf(axisInt->x / CELL_SIZE);
-        size_t mapRow = (size_t)floorf(axisInt->y / CELL_SIZE);
-        if (mapRow >= ROWS || mapCol >= COLS || ROOM[mapRow * COLS + mapCol] != '#') {
-            // not in wall, so continue
-            return castRay(*axisInt, u, axisInt);
-        }
-    } else {
-        return false;
-    }
-    return true;
 }
 
 float DistanceFromPointToLine(Vector2 point, Vector2 l1, Vector2 l2) {
@@ -229,8 +269,12 @@ void DrawMinimap(Texture2D wall4_texture, float cellScale) {
              gameState.mapPos.x + COLS * CELL_SIZE, gameState.mapPos.y + ROWS * CELL_SIZE, GREEN);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    const char *mapPath = argc > 1 ? argv[1] : DEFAULT_MAP;
+    if (!LoadMap(mapPath)) {
+        return 1;
+    }
 
     if (DEBUG) {
         Vector2 cast = {0};
@@ -282,25 +326,34 @@ int main(void)
             ClearBackground(BACKGROUND);
             Vector2 playerPos = mapToScreen((Vector2) {gameState.player.x, gameState.player.y});
             float rectWidth = (float) WIDTH / CAST_STEPS;
-            float angStep = FOV / CAST_STEPS;
             float projDist = (WIDTH / 2.0f) / tanf(FOV / 2.0f);
             // Camera forward direction (unit vector along cameraAngle)
             Vector2 forward = (Vector2){cosf(gameState.cameraAngle), -sinf(gameState.cameraAngle)};
+            // Screen-left direction (forward rotated a quarter turn)
+            Vector2 left = (Vector2){-sinf(gameState.cameraAngle), -cosf(gameState.cameraAngle)};
             DrawFloorGrid(projDist);
             for (int c = 0; c < CAST_STEPS; c++) {
-                float castAngle = gameState.cameraAngle + 0.5f * FOV - c * angStep;
-                Vector2 u = (Vector2) { cosf(castAngle), -sinf(castAngle) };
+                // Sample the projection plane at uniform screen intervals, not at
+                // uniform angles: angle is not linear in screen x, so pairing uniform
+                // angles with a linear x placement bows flat walls into curves.
+                float planeX = (c + 0.5f) * rectWidth - WIDTH / 2.0f;
+                Vector2 dir = { forward.x * projDist - left.x * planeX,
+                                forward.y * projDist - left.y * planeX };
+                Vector2 u = VectorScale(dir, 1.0f / sqrtf(VectorMagSquared(dir)));
                 Vector2 cast = {0};
                 if (castRay(gameState.player, u, &cast)) {
                     // Perpendicular distance to camera plane (dot product removes fisheye)
                     Vector2 toCast = VectorSub(cast, gameState.player);
                     float distToCast = toCast.x * forward.x + toCast.y * forward.y;
-                    if (distToCast > NEAR_CLIP) {
-                        float wallHeight = projDist * CELL_SIZE / distToCast;
-                        Vector2 topLeft = { rectWidth * c, 0.5f * HEIGHT - 0.5f * wallHeight };
-                        Vector2 size = { rectWidth, wallHeight };
-                        DrawRectangleV(topLeft, size, BLUE);
+                    // Clamp rather than skip: a wall nearer than the near plane still
+                    // covers the whole column, and skipping leaves a black hole.
+                    if (distToCast < (float)NEAR_CLIP) {
+                        distToCast = (float)NEAR_CLIP;
                     }
+                    float wallHeight = projDist * CELL_SIZE / distToCast;
+                    Vector2 topLeft = { rectWidth * c, 0.5f * HEIGHT - 0.5f * wallHeight };
+                    Vector2 size = { rectWidth, wallHeight };
+                    DrawRectangleV(topLeft, size, BLUE);
                 }
             }
             DrawMinimap(wall4_texture, cellScale);
