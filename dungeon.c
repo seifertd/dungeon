@@ -128,6 +128,46 @@ float VectorMagSquared(Vector2 v) {
     return v.x * v.x + v.y * v.y;
 }
 
+// Is the cell containing this world point solid?  Outside the map reads as open
+// space, matching castRay: the renderer draws nothing out there, so blocking
+// movement there would be invisible to the player.
+static bool IsWallAt(float x, float y) {
+    int col = (int)floorf(x / CELL_SIZE);
+    int row = (int)floorf(y / CELL_SIZE);
+    if (row < 0 || row >= (int)ROWS || col < 0 || col >= (int)COLS) {
+        return false;
+    }
+    return ROOM[row * COLS + col] == '#';
+}
+
+// The player is treated as a square of side 2*PLAYER_RADIUS rather than a point,
+// so the camera never touches a wall face (which would fill the screen with a
+// single column) and cannot squeeze diagonally between two corner-to-corner
+// walls.  Must stay below CELL_SIZE/2 or the player cannot fit down a 1-cell gap.
+static const float PLAYER_RADIUS = CELL_SIZE * 0.3f;
+
+static bool PlayerFitsAt(float x, float y) {
+    float r = PLAYER_RADIUS;
+    return !IsWallAt(x - r, y - r) && !IsWallAt(x + r, y - r)
+        && !IsWallAt(x - r, y + r) && !IsWallAt(x + r, y + r);
+}
+
+// Move the player by delta, stopping at walls.  Each axis is resolved separately
+// so that walking into a wall at an angle slides along it instead of stopping
+// dead.  The move is split into sub-steps shorter than the player's radius so a
+// long frame (or a future speed boost) can never tunnel through a wall.
+static void MovePlayer(Vector2 delta) {
+    float len = sqrtf(VectorMagSquared(delta));
+    int steps = (int)(len / (PLAYER_RADIUS * 0.5f)) + 1;
+    Vector2 step = VectorScale(delta, 1.0f / (float)steps);
+    Vector2 p = gameState.player;
+    for (int i = 0; i < steps; i++) {
+        if (PlayerFitsAt(p.x + step.x, p.y)) p.x += step.x;
+        if (PlayerFitsAt(p.x, p.y + step.y)) p.y += step.y;
+    }
+    gameState.player = p;
+}
+
 // Walk the grid cell by cell along the ray (DDA) until a wall is hit or FAR_CLIP
 // is passed.  Iterative, and it tracks distance travelled along the ray instead
 // of absolute world coordinates, so precision does not degrade as the player
@@ -172,7 +212,7 @@ bool castRay(Vector2 start, Vector2 u, Vector2 *axisInt) {
 }
 
 float DistanceFromPointToLine(Vector2 point, Vector2 l1, Vector2 l2) {
-    float dist, m, b, a, c = 0.0;
+    float m, b, a, c = 0.0;
     if (l1.x == l2.x) {
         // special case 
         a = 1.0;
@@ -246,10 +286,6 @@ void DrawMinimap(Texture2D wall4_texture, float cellScale) {
         Vector2 cellPos = {0};
         for (size_t c = 0; c < COLS; c++) {
             cellPos = mapToScreen((Vector2) {CELL_SIZE * c, CELL_SIZE * r});
-            Vector2 cellPosCenter = (Vector2) {
-                cellPos.x + CELL_SIZE / 2,
-                cellPos.y + CELL_SIZE / 2
-            };
             switch (ROOM[r * COLS + c]) {
                 case '#':
                     DrawTextureEx(wall4_texture, cellPos, 0.0, cellScale, WHITE);
@@ -305,10 +341,10 @@ int main(int argc, char **argv)
             float dt = GetFrameTime();
             Vector2 moveDir = (Vector2) {cosf(gameState.cameraAngle), -sinf(gameState.cameraAngle)};
             if (IsKeyDown(KEY_W)) {
-              gameState.player = VectorAdd(gameState.player, VectorScale(moveDir, dt * MOVE_SPEED));
+              MovePlayer(VectorScale(moveDir, dt * MOVE_SPEED));
             }
             if (IsKeyDown(KEY_S)) {
-              gameState.player = VectorAdd(gameState.player, VectorScale(moveDir, -dt * MOVE_SPEED));
+              MovePlayer(VectorScale(moveDir, -dt * MOVE_SPEED));
             }
             if (IsKeyDown(KEY_A)) {
               gameState.cameraAngle += dt * ROTATION_SPEED;
@@ -332,7 +368,7 @@ int main(int argc, char **argv)
             // Screen-left direction (forward rotated a quarter turn)
             Vector2 left = (Vector2){-sinf(gameState.cameraAngle), -cosf(gameState.cameraAngle)};
             DrawFloorGrid(projDist);
-            for (int c = 0; c < CAST_STEPS; c++) {
+            for (size_t c = 0; c < CAST_STEPS; c++) {
                 // Sample the projection plane at uniform screen intervals, not at
                 // uniform angles: angle is not linear in screen x, so pairing uniform
                 // angles with a linear x placement bows flat walls into curves.
