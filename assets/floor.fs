@@ -17,7 +17,15 @@
 // Bound by the DrawTexturePro call in DrawFloorGPU -- this is the floor texture.
 uniform sampler2D texture0;
 
-uniform vec2  uResolution;   // render target size in pixels
+uniform vec2  uResolution;   // logical screen size, matching WIDTH/HEIGHT
+// Framebuffer pixels per logical pixel.  gl_FragCoord is in framebuffer pixels,
+// and under Wayland fractional scaling those are not the same thing: on a
+// 1.25-scale output a 1280x760 window gets a 1600x950 framebuffer.  Everything
+// else in the renderer goes through raylib's 2D pipeline, which maps logical
+// coordinates onto that for us; this shader reads device coordinates directly,
+// so it is the one place that has to undo the scaling itself.  Varies at
+// runtime -- dragging the window between differently-scaled monitors changes it.
+uniform vec2  uFragScale;
 uniform vec2  uPlayer;       // camera position, world units
 uniform vec2  uForward;      // unit vector, camera facing
 uniform vec2  uLeft;         // unit vector, screen-left (perpendicular to uForward)
@@ -32,17 +40,21 @@ out vec4 finalColor;
 
 void main()
 {
+    // Into logical pixels first, so everything below is in the same units as
+    // the CPU path and the projection constants.
+    vec2 frag = gl_FragCoord.xy / uFragScale;
+
     // gl_FragCoord has a lower-left origin and sits at pixel centres, while
     // raylib's screen y counts down from the top; the flip reconciles them so
     // this matches the CPU path's (y + 0.5) - HEIGHT/2 exactly.
-    float sy = uResolution.y - gl_FragCoord.y;
+    float sy = uResolution.y - frag.y;
     float dy = sy - uResolution.y * 0.5;
     if (dy <= 0.0) discard;                 // at or above the horizon
 
     float rowDist = uProjDist * uEyeHeight / dy;
     if (rowDist > uFarClip) discard;
 
-    float planeX = gl_FragCoord.x - uResolution.x * 0.5;
+    float planeX = frag.x - uResolution.x * 0.5;
     vec2  world  = uPlayer
                  + uForward * rowDist
                  - uLeft * (planeX * rowDist / uProjDist);

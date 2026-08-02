@@ -193,21 +193,57 @@ static const float PLAYER_RADIUS = CELL_SIZE * 0.3f;
 // barrel will not feel like the barrel you can see.
 static const float SPRITE_RADIUS = CELL_SIZE * 0.22f;
 
-static bool PlayerFitsAt(float x, float y) {
+// How head-on a move must be to push rather than slide, as cos(angle) between
+// the direction of travel and the direction to the sprite.  0.7 is about 45
+// degrees.  Without a gate like this, brushing past a barrel while running
+// drags it sideways, which reads as the barrel being sticky rather than heavy.
+static const float PUSH_DIRECTNESS = 0.7f;
+
+// Would the player's square overlap a wall centred here?
+static bool WallBlocksPlayer(float x, float y) {
     float r = PLAYER_RADIUS;
+    return IsWallAt(x - r, y - r) || IsWallAt(x + r, y - r)
+        || IsWallAt(x - r, y + r) || IsWallAt(x + r, y + r);
+}
+
+// Index of a sprite the player would overlap centred here, or -1 for none.
+//
+// Against sprites the player is a circle rather than the square used for walls:
+// there are no axis-aligned faces here for a square to line up with, and a
+// centre-distance test is what makes MovePlayer's per-axis resolution slide
+// around a barrel instead of catching on it.
+//
+// Linear in sprite count, which is nothing at this scale -- a map with hundreds
+// would want them bucketed by cell, the way IsWallAt indexes ROOM.  Note that
+// sprites move, so such an index could not be built once at load.
+static int BlockingSprite(float x, float y) {
+    float reach = PLAYER_RADIUS + SPRITE_RADIUS;
+    for (size_t i = 0; i < SPRITE_COUNT; i++) {
+        Vector2 d = {x - SPRITES[i].x, y - SPRITES[i].y};
+        if (VectorMagSquared(d) < reach * reach) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static bool PlayerFitsAt(float x, float y) {
+    return !WallBlocksPlayer(x, y) && BlockingSprite(x, y) < 0;
+}
+
+// Can sprite `self` stand here?  Walls, plus every other sprite.  The wall test
+// samples the corners of the sprite's bounding box, the same square
+// approximation used for the player -- slightly conservative on the diagonals,
+// and consistent with how the player negotiates the same gaps.
+static bool SpriteFitsAt(size_t self, float x, float y) {
+    float r = SPRITE_RADIUS;
     if (IsWallAt(x - r, y - r) || IsWallAt(x + r, y - r)
      || IsWallAt(x - r, y + r) || IsWallAt(x + r, y + r)) {
         return false;
     }
-    // Against sprites the player is a circle rather than the square used for
-    // walls: there are no axis-aligned faces here for a square to line up with,
-    // and a centre-distance test is what makes MovePlayer's per-axis resolution
-    // slide around a barrel instead of catching on it.
-    //
-    // Linear in sprite count, which is nothing at this scale -- a map with
-    // hundreds would want them bucketed by cell, the way IsWallAt indexes ROOM.
-    float reach = PLAYER_RADIUS + SPRITE_RADIUS;
+    float reach = SPRITE_RADIUS * 2.0f;
     for (size_t i = 0; i < SPRITE_COUNT; i++) {
+        if (i == self) continue;
         Vector2 d = {x - SPRITES[i].x, y - SPRITES[i].y};
         if (VectorMagSquared(d) < reach * reach) {
             return false;
@@ -220,14 +256,55 @@ static bool PlayerFitsAt(float x, float y) {
 // so that walking into a wall at an angle slides along it instead of stopping
 // dead.  The move is split into sub-steps shorter than the player's radius so a
 // long frame (or a future speed boost) can never tunnel through a wall.
+// One axis of one sub-step.  Moves the player if the destination is clear, and
+// otherwise tries to push whatever sprite is in the way.  `heading` is the unit
+// direction of the whole move, not of this axis: the push gate has to judge
+// where the player is actually going, or strafing past a barrel would shove it.
+static void StepPlayerAxis(Vector2 *p, float dx, float dy, Vector2 heading) {
+    float nx = p->x + dx, ny = p->y + dy;
+    if (PlayerFitsAt(nx, ny)) {
+        p->x = nx;
+        p->y = ny;
+        return;
+    }
+    if (WallBlocksPlayer(nx, ny)) return;   // walls never give
+    int s = BlockingSprite(nx, ny);
+    if (s < 0) return;
+
+    Vector2 toSprite = VectorSub(SPRITES[s], *p);
+    float m = sqrtf(VectorMagSquared(toSprite));
+    if (m < 1e-6f) return;
+    if ((heading.x * toSprite.x + heading.y * toSprite.y) / m < PUSH_DIRECTNESS) {
+        return;                              // glancing contact: slide, not push
+    }
+    if (!SpriteFitsAt((size_t)s, SPRITES[s].x + dx, SPRITES[s].y + dy)) {
+        return;                              // nowhere for it to go
+    }
+
+    // Displace the sprite by exactly the player's delta, which preserves their
+    // separation -- so the player's destination is clear of *this* sprite by
+    // construction.  It can still be inside a different one, hence the recheck.
+    Vector2 was = SPRITES[s];
+    SPRITES[s].x += dx;
+    SPRITES[s].y += dy;
+    if (!PlayerFitsAt(nx, ny)) {
+        SPRITES[s] = was;
+        return;
+    }
+    p->x = nx;
+    p->y = ny;
+}
+
 static void MovePlayer(Vector2 delta) {
     float len = sqrtf(VectorMagSquared(delta));
+    if (len < 1e-6f) return;
+    Vector2 heading = VectorScale(delta, 1.0f / len);
     int steps = (int)(len / (PLAYER_RADIUS * 0.5f)) + 1;
     Vector2 step = VectorScale(delta, 1.0f / (float)steps);
     Vector2 p = gameState.player;
     for (int i = 0; i < steps; i++) {
-        if (PlayerFitsAt(p.x + step.x, p.y)) p.x += step.x;
-        if (PlayerFitsAt(p.x, p.y + step.y)) p.y += step.y;
+        StepPlayerAxis(&p, step.x, 0.0f, heading);
+        StepPlayerAxis(&p, 0.0f, step.y, heading);
     }
     gameState.player = p;
 }
@@ -497,7 +574,7 @@ static Shader    floorShader = {0};
 // Only the camera moves, so the rest of the uniforms are set once at load and
 // these are the four worth caching a location for.
 static struct {
-    int player, forward, left, projDist;
+    int player, forward, left, projDist, fragScale;
 } floorLoc;
 
 static int NextPowerOfTwo(int v) {
@@ -556,7 +633,8 @@ static bool InitFloor(const char *texPath, const char *shaderPath) {
     floorLoc.player   = GetShaderLocation(floorShader, "uPlayer");
     floorLoc.forward  = GetShaderLocation(floorShader, "uForward");
     floorLoc.left     = GetShaderLocation(floorShader, "uLeft");
-    floorLoc.projDist = GetShaderLocation(floorShader, "uProjDist");
+    floorLoc.projDist  = GetShaderLocation(floorShader, "uProjDist");
+    floorLoc.fragScale = GetShaderLocation(floorShader, "uFragScale");
 
     float resolution[2] = {(float)WIDTH, (float)HEIGHT};
     float mapSize[2]    = {COLS * (float)CELL_SIZE, ROWS * (float)CELL_SIZE};
@@ -596,6 +674,14 @@ static void DrawFloorGPU(float projDist, Vector2 forward, Vector2 left) {
     SetShaderValue(floorShader, floorLoc.forward,  &forward,          SHADER_UNIFORM_VEC2);
     SetShaderValue(floorShader, floorLoc.left,     &left,             SHADER_UNIFORM_VEC2);
     SetShaderValue(floorShader, floorLoc.projDist, &projDist,         SHADER_UNIFORM_FLOAT);
+
+    // Re-read every frame rather than caching at load: the framebuffer is
+    // resized when the window moves between monitors of different scale, and
+    // under Wayland fractional scaling that happens without any resize of the
+    // window itself.  On a 1.0-scale monitor this is (1,1) and costs nothing.
+    float fragScale[2] = {GetRenderWidth() / (float)WIDTH,
+                          GetRenderHeight() / (float)HEIGHT};
+    SetShaderValue(floorShader, floorLoc.fragScale, fragScale, SHADER_UNIFORM_VEC2);
 
     Rectangle src  = {0, 0, (float)floorGpuTex.width, (float)floorGpuTex.height};
     Rectangle dest = {0, (float)FLOOR_TOP, (float)WIDTH, (float)FLOOR_ROWS};
