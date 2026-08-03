@@ -1,20 +1,24 @@
 #version 330
 
-// Floor plane, drawn by inverse-projecting each fragment.
+// The floor and ceiling planes, drawn by inverse-projecting each fragment.
 //
-// This is the same derivation as the CPU path in DrawFloor (dungeon.c), just
-// evaluated per fragment instead of stepped per row: the camera sits at
-// uEyeHeight above a flat floor, so a fragment dy pixels below the horizon is
-// looking at floor that is uProjDist*uEyeHeight/dy ahead, and the lateral offset
-// scales with that same distance.
+// The camera sits at uEyeHeight above a flat floor, so a fragment dy pixels
+// below the horizon is looking at floor that is uProjDist*uEyeHeight/dy ahead,
+// and the lateral offset scales with that same distance.
+//
+// The ceiling is the same derivation mirrored, and it is exactly a mirror
+// because the eye sits at half of uCellSize: the ceiling is uEyeHeight above
+// the camera just as the floor is uEyeHeight below it.  So one shader draws
+// both, run twice with uHalf flipping which side of the horizon it accepts.
 //
 // The reason this is worth doing on the GPU is not only speed.  The hardware
 // computes the screen-space derivative of the texture coordinate itself, so the
 // fetch below picks a mip level (and an anisotropic tap pattern) per fragment.
-// A floor viewed at a grazing angle is the worst case for minification, and the
-// point-sampled CPU path aliases badly there; here it is handled for free.
+// A plane viewed at a grazing angle is the worst case for minification, and a
+// point-sampled version of this aliases badly there; here it is handled free.
 
-// Bound by the DrawTexturePro call in DrawFloorGPU -- this is the floor texture.
+// Bound by the DrawTexturePro call in DrawPlaneHalf.  Both passes draw the same
+// texture -- what separates floor from ceiling is uTint, not the artwork.
 uniform sampler2D texture0;
 
 uniform vec2  uResolution;   // logical screen size, matching WIDTH/HEIGHT
@@ -35,6 +39,14 @@ uniform vec2  uMapSize;      // map extent in world units
 uniform float uCellSize;     // world units per dungeon cell = one texture tile
 uniform float uFarClip;
 uniform float uFogDist;
+// Which side of the horizon this pass draws: +1 below (floor), -1 above
+// (ceiling).  It folds the two cases into one sign, so the projection below is
+// written once and cannot drift between them.
+uniform float uHalf;
+// Multiplied into the texel.  With one texture serving both planes this is the
+// only thing distinguishing them, so it is not decoration -- see PLANE_TINT_*
+// in dungeon.c.
+uniform vec3  uTint;
 
 out vec4 finalColor;
 
@@ -45,11 +57,15 @@ void main()
     vec2 frag = gl_FragCoord.xy / uFragScale;
 
     // gl_FragCoord has a lower-left origin and sits at pixel centres, while
-    // raylib's screen y counts down from the top; the flip reconciles them so
-    // this matches the CPU path's (y + 0.5) - HEIGHT/2 exactly.
+    // raylib's screen y counts down from the top; the flip reconciles them.
     float sy = uResolution.y - frag.y;
-    float dy = sy - uResolution.y * 0.5;
-    if (dy <= 0.0) discard;                 // at or above the horizon
+
+    // Distance from the horizon, always positive: uHalf makes "away from the
+    // horizon" mean downwards for the floor and upwards for the ceiling.  Each
+    // pass is drawn over only its own half of the screen, so this rejects just
+    // the horizon row itself, where the plane is edge-on and infinitely far.
+    float dy = (sy - uResolution.y * 0.5) * uHalf;
+    if (dy <= 0.0) discard;
 
     float rowDist = uProjDist * uEyeHeight / dy;
     if (rowDist > uFarClip) discard;
@@ -69,5 +85,5 @@ void main()
     // Wrapping is the sampler's REPEAT mode, so no explicit fract() is needed.
     vec3  texel = texture(texture0, world / uCellSize).rgb;
     float shade = clamp(1.0 - rowDist / uFogDist, 0.0, 1.0);
-    finalColor  = vec4(texel * shade, 1.0);
+    finalColor  = vec4(texel * uTint * shade, 1.0);
 }

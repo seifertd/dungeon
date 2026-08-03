@@ -24,16 +24,23 @@ first argument (`./dungeon path/to/map.txt`). One character per cell:
 
 ## Controls
 
-| Key     | Action                                            |
-| ------- | ------------------------------------------------- |
-| `W`/`S` | Move forward / back                               |
-| `A`/`D` | Turn left / right                                 |
-| `M`     | Toggle the top-down minimap overlay               |
-| `F`     | Toggle the floor renderer between GPU and CPU     |
+| Key     | Action                              |
+| ------- | ----------------------------------- |
+| `W`/`S` | Move forward / back                 |
+| `A`/`D` | Turn left / right                   |
+| `M`     | Toggle the top-down minimap overlay |
 
-Walls and the floor are drawn by two different techniques, both from the same
-raycast. Walls are GPU-stretched texture columns; the floor is an inverse
-projection evaluated per fragment by `assets/floor.fs`. `F` switches the floor
-to an equivalent per-pixel CPU implementation, kept as a reference — it is
-about 4.6 ms/frame slower and aliases in the distance, since it point-samples
-where the shader gets mipmapping for free.
+Walls and the horizontal planes are drawn by two different techniques, both
+from the same raycast. Walls are GPU-stretched texture columns. The floor and
+ceiling are an inverse projection evaluated per fragment by `assets/floor.fs`,
+which lets the hardware pick a mip level from the texture coordinate's
+screen-space derivative — without that, a plane viewed nearly edge-on aliases
+and crawls in the distance.
+
+One shader draws both planes, run once per half of the screen with `uHalf`
+flipping which side of the horizon it accepts. The two are mirror images
+because the camera sits at half the wall height, exactly midway between them.
+They also share the one texture and are told apart only by tint
+(`PLANE_TINT_FLOOR` and `PLANE_TINT_CEILING` in `dungeon.c`), so giving the
+ceiling its own artwork later is a second `Texture2D` rather than a second code
+path.

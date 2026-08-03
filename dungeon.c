@@ -527,114 +527,80 @@ static void DrawSprites(Texture2D tex, const float *wallDepth, float projDist,
 }
 
 // ---------------------------------------------------------------------------
-// Floor casting
+// Floor and ceiling
 //
-// The floor cannot reuse the trick DrawWallColumn relies on.  A wall column has
-// a single depth for its whole height, so a one-texel source rect stretched
-// vertically is exactly right and the GPU does all the work.  The floor has the
-// transposed property -- one depth per screen *row*, and across that row the
+// Neither plane can reuse the trick DrawWallColumn relies on.  A wall column
+// has a single depth for its whole height, so a one-texel source rect stretched
+// vertically is exactly right and the GPU does all the work.  A floor row has
+// the transposed property -- one depth per screen *row*, and across that row the
 // world position is affine in screen x -- but the path that row traces through
 // the texture is an arbitrary diagonal, and DrawTexturePro can only take an
 // axis-aligned source rect.  There is no blit that expresses it.
 //
-// There are two implementations of the same inverse projection, switchable at
-// runtime with F so they can be compared side by side:
-//
-//   FLOOR_GPU (default)  assets/floor.fs evaluates it per fragment.
-//   FLOOR_CPU            sampled per pixel into a scratch buffer, uploaded as
-//                        one texture per frame.
-//
-// The GPU path is both cheaper and better looking.  Cheaper because the CPU one
-// costs ~WIDTH*HEIGHT/2 samples a frame no matter what.  Better looking because
+// So the inverse projection is evaluated per fragment by assets/floor.fs, which
+// is not merely faster than doing it per pixel on the CPU but better looking:
 // the hardware knows the screen-space derivative of the texture coordinate and
-// picks a mip level from it; the CPU path point-samples, so the distant floor --
-// which is minified hard, being viewed nearly edge-on -- aliases and crawls.
-// Fixing that on the CPU would mean computing a mip level and blending by hand,
-// making the expensive path more expensive still.
+// picks a mip level from it.  A plane viewed nearly edge-on is the worst case
+// for minification, and point sampling it -- which is all a CPU version would
+// realistically do -- aliases and crawls in the distance.
+//
+// Floor and ceiling run the same shader over opposite halves of the screen.
+// They can share it because EYE_HEIGHT is half of CELL_SIZE, which puts the
+// camera exactly midway between them, so the two projections are mirror images;
+// see the uHalf uniform.  They also share the one texture, differing only by
+// tint -- so the ceiling costs no artwork, and swapping in a real ceiling
+// texture later is a second Texture2D rather than a second code path.
 // ---------------------------------------------------------------------------
 
-typedef enum { FLOOR_GPU, FLOOR_CPU } FloorMode;
-static FloorMode floorMode = FLOOR_GPU;
+static const int HORIZON_Y     = HEIGHT / 2;              // horizon row
+static const int CEILING_ROWS  = HEIGHT / 2;              // rows above it
+static const int FLOOR_ROWS    = HEIGHT - HEIGHT / 2;     // rows below it
 
-static const int FLOOR_TOP  = HEIGHT / 2;          // horizon row
-static const int FLOOR_ROWS = HEIGHT - HEIGHT / 2;
+// What separates floor from ceiling, given that both draw the same texels.
+// The ceiling is darker and cooler: light in a dungeon comes from below, and
+// the eye reads brightness before it reads pattern, so this is enough for the
+// two planes to be told apart even though the artwork is identical.  Keep them
+// far enough apart in value to survive the fog curve, which compresses both
+// towards black with distance.
+static const Vector3 PLANE_TINT_FLOOR   = {1.00f, 1.00f, 1.00f};
+static const Vector3 PLANE_TINT_CEILING = {0.55f, 0.58f, 0.70f};
 
-static Image     floorSrc    = {0};   // CPU-side texels of the floor texture
-static Color    *floorTexels = NULL;  // floorSrc.data, typed
-static int       floorMaskX  = 0;     // width-1 / height-1.  The texture is
-static int       floorMaskY  = 0;     // forced power-of-two at load, so wrapping
-                                      // is a mask rather than a per-pixel modulo
-static float     floorScaleX = 0.0f;  // texels per world unit
-static float     floorScaleY = 0.0f;
-static Color    *floorBuf    = NULL;  // WIDTH x FLOOR_ROWS scratch framebuffer
-static Texture2D floorTex    = {0};   // its GPU copy, re-uploaded every frame
-
-static Texture2D floorGpuTex = {0};   // mipmapped, REPEAT-wrapped, for the shader
-static Shader    floorShader = {0};
-// Only the camera moves, so the rest of the uniforms are set once at load and
-// these are the four worth caching a location for.
+static Texture2D planeTex    = {0};   // mipmapped, REPEAT-wrapped, for the shader
+static Shader    planeShader = {0};
+// Only the camera and the per-half settings change, so the rest of the uniforms
+// are set once at load and these are the ones worth caching a location for.
 static struct {
-    int player, forward, left, projDist, fragScale;
-} floorLoc;
+    int player, forward, left, projDist, fragScale, half, tint;
+} planeLoc;
 
-static int NextPowerOfTwo(int v) {
-    int p = 1;
-    while (p < v) p <<= 1;
-    return p;
-}
-
-// Load the floor texture, allocate the CPU path's scratch framebuffer, and
-// compile the GPU path's shader.  Must be called after InitWindow: it creates
-// GPU objects.  Returns false only if the texture is missing -- a shader that
-// fails to compile falls back to FLOOR_CPU rather than killing the program.
-static bool InitFloor(const char *texPath, const char *shaderPath) {
-    floorSrc = LoadImage(texPath);
-    if (floorSrc.data == NULL) {
-        fprintf(stderr, "InitFloor: cannot load '%s'\n", texPath);
+// Load the plane texture and compile the shader.  Must be called after
+// InitWindow: it creates GPU objects.  Both failures are fatal -- the shader is
+// the only implementation of the floor and ceiling, so there is nothing to fall
+// back to and a silent flat-shaded world would be worse than a clear error.
+static bool InitPlanes(const char *texPath, const char *shaderPath) {
+    // REPEAT gives the per-cell tiling; the mipmap chain is what keeps the
+    // distant, nearly edge-on plane from aliasing.
+    planeTex = LoadTexture(texPath);
+    if (!IsTextureValid(planeTex)) {
+        fprintf(stderr, "InitPlanes: cannot load '%s'\n", texPath);
         return false;
     }
-    // The CPU path indexes the pixels directly, so pin the layout to 4-byte
-    // RGBA rather than trusting whatever the file happened to decode to.
-    ImageFormat(&floorSrc, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    GenTextureMipmaps(&planeTex);
+    SetTextureFilter(planeTex, TEXTURE_FILTER_TRILINEAR);
+    SetTextureWrap(planeTex, TEXTURE_WRAP_REPEAT);
 
-    int w = NextPowerOfTwo(floorSrc.width);
-    int h = NextPowerOfTwo(floorSrc.height);
-    if (w != floorSrc.width || h != floorSrc.height) {
-        ImageResize(&floorSrc, w, h);
+    planeShader = LoadShader(NULL, shaderPath); // NULL vs = raylib's default
+    if (!IsShaderValid(planeShader)) {
+        fprintf(stderr, "InitPlanes: '%s' did not compile\n", shaderPath);
+        return false;
     }
-    floorTexels = (Color *)floorSrc.data;
-    floorMaskX  = floorSrc.width  - 1;
-    floorMaskY  = floorSrc.height - 1;
-    // One full tile per dungeon cell, which is how wall faces are mapped too --
-    // so a floor tile lines up with the wall above it.
-    floorScaleX = floorSrc.width  / (float)CELL_SIZE;
-    floorScaleY = floorSrc.height / (float)CELL_SIZE;
-
-    floorBuf = calloc((size_t)WIDTH * FLOOR_ROWS, sizeof *floorBuf);
-    Image scratch = {.data = floorBuf, .width = (int)WIDTH, .height = FLOOR_ROWS,
-                     .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
-    floorTex = LoadTextureFromImage(scratch);
-
-    // The shader's copy of the texture wants the settings the CPU path emulates
-    // by hand: REPEAT for the per-cell tiling, and a mipmap chain so minified
-    // floor resolves to an average instead of a randomly chosen texel.
-    floorGpuTex = LoadTextureFromImage(floorSrc);
-    GenTextureMipmaps(&floorGpuTex);
-    SetTextureFilter(floorGpuTex, TEXTURE_FILTER_TRILINEAR);
-    SetTextureWrap(floorGpuTex, TEXTURE_WRAP_REPEAT);
-
-    floorShader = LoadShader(NULL, shaderPath); // NULL vs = raylib's default
-    if (!IsShaderValid(floorShader)) {
-        fprintf(stderr, "InitFloor: '%s' did not compile, using the CPU path\n",
-                shaderPath);
-        floorMode = FLOOR_CPU;
-        return true;
-    }
-    floorLoc.player   = GetShaderLocation(floorShader, "uPlayer");
-    floorLoc.forward  = GetShaderLocation(floorShader, "uForward");
-    floorLoc.left     = GetShaderLocation(floorShader, "uLeft");
-    floorLoc.projDist  = GetShaderLocation(floorShader, "uProjDist");
-    floorLoc.fragScale = GetShaderLocation(floorShader, "uFragScale");
+    planeLoc.player    = GetShaderLocation(planeShader, "uPlayer");
+    planeLoc.forward   = GetShaderLocation(planeShader, "uForward");
+    planeLoc.left      = GetShaderLocation(planeShader, "uLeft");
+    planeLoc.projDist  = GetShaderLocation(planeShader, "uProjDist");
+    planeLoc.fragScale = GetShaderLocation(planeShader, "uFragScale");
+    planeLoc.half      = GetShaderLocation(planeShader, "uHalf");
+    planeLoc.tint      = GetShaderLocation(planeShader, "uTint");
 
     float resolution[2] = {(float)WIDTH, (float)HEIGHT};
     float mapSize[2]    = {COLS * (float)CELL_SIZE, ROWS * (float)CELL_SIZE};
@@ -642,38 +608,63 @@ static bool InitFloor(const char *texPath, const char *shaderPath) {
     float eyeHeight     = EYE_HEIGHT;
     float farClip       = (float)FAR_CLIP;
     float fogDist       = FOG_DIST;
-    SetShaderValue(floorShader, GetShaderLocation(floorShader, "uResolution"),
+    SetShaderValue(planeShader, GetShaderLocation(planeShader, "uResolution"),
                    resolution, SHADER_UNIFORM_VEC2);
-    SetShaderValue(floorShader, GetShaderLocation(floorShader, "uMapSize"),
+    SetShaderValue(planeShader, GetShaderLocation(planeShader, "uMapSize"),
                    mapSize, SHADER_UNIFORM_VEC2);
-    SetShaderValue(floorShader, GetShaderLocation(floorShader, "uCellSize"),
+    SetShaderValue(planeShader, GetShaderLocation(planeShader, "uCellSize"),
                    &cellSize, SHADER_UNIFORM_FLOAT);
-    SetShaderValue(floorShader, GetShaderLocation(floorShader, "uEyeHeight"),
+    SetShaderValue(planeShader, GetShaderLocation(planeShader, "uEyeHeight"),
                    &eyeHeight, SHADER_UNIFORM_FLOAT);
-    SetShaderValue(floorShader, GetShaderLocation(floorShader, "uFarClip"),
+    SetShaderValue(planeShader, GetShaderLocation(planeShader, "uFarClip"),
                    &farClip, SHADER_UNIFORM_FLOAT);
-    SetShaderValue(floorShader, GetShaderLocation(floorShader, "uFogDist"),
+    SetShaderValue(planeShader, GetShaderLocation(planeShader, "uFogDist"),
                    &fogDist, SHADER_UNIFORM_FLOAT);
     return true;
 }
 
-static void UnloadFloor(void) {
-    UnloadShader(floorShader);
-    UnloadTexture(floorGpuTex);
-    UnloadTexture(floorTex);
-    UnloadImage(floorSrc);
-    free(floorBuf);
+static void UnloadPlanes(void) {
+    UnloadShader(planeShader);
+    UnloadTexture(planeTex);
 }
 
-// The shader does the projection, so all this has to do is feed it the camera
-// and cover the region below the horizon with fragments.  Drawing the floor
+// Cover one half of the screen with the plane shader.  Drawing the plane
 // texture itself (rather than a bare rectangle) is what binds it as texture0;
 // the shader ignores the incoming texture coordinates and computes its own.
-static void DrawFloorGPU(float projDist, Vector2 forward, Vector2 left) {
-    SetShaderValue(floorShader, floorLoc.player,   &gameState.player, SHADER_UNIFORM_VEC2);
-    SetShaderValue(floorShader, floorLoc.forward,  &forward,          SHADER_UNIFORM_VEC2);
-    SetShaderValue(floorShader, floorLoc.left,     &left,             SHADER_UNIFORM_VEC2);
-    SetShaderValue(floorShader, floorLoc.projDist, &projDist,         SHADER_UNIFORM_FLOAT);
+//
+// Each half gets its own shader-mode block on purpose.  raylib defers
+// DrawTexturePro into a vertex batch, and two draws sharing a texture and blend
+// state coalesce into a single one -- so uniforms set between them would not
+// take effect between them, and whichever half was set up last would win for
+// both.  Since each quad covers only its own half of the screen and the shader
+// discards the other side, that does not blend the two: it drops one entirely.
+// Ending shader mode flushes the batch, which is what ties each set of uniforms
+// to the draw it was set for.
+static void DrawPlaneHalf(float half, Vector3 tint, float top, float rows) {
+    SetShaderValue(planeShader, planeLoc.half, &half, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(planeShader, planeLoc.tint, &tint, SHADER_UNIFORM_VEC3);
+
+    Rectangle src  = {0, 0, (float)planeTex.width, (float)planeTex.height};
+    Rectangle dest = {0, top, (float)WIDTH, rows};
+    BeginShaderMode(planeShader);
+        DrawTexturePro(planeTex, src, dest, (Vector2){0, 0}, 0.0f, WHITE);
+    EndShaderMode();
+}
+
+// Draw the ceiling and floor.  Must run before the wall columns: a wall of
+// height CELL_SIZE seen from EYE_HEIGHT -- which is half of it -- projects
+// symmetrically about the horizon, and its top and bottom edges land exactly
+// where the ceiling and floor at that wall's distance meet the screen.  So
+// painting walls afterwards covers precisely the plane pixels the wall occludes
+// and no others.
+//
+// The shader does the projection, so all this has to do is feed it the camera
+// and then hand each half its own sign and tint.
+static void DrawPlanes(float projDist, Vector2 forward, Vector2 left) {
+    SetShaderValue(planeShader, planeLoc.player,   &gameState.player, SHADER_UNIFORM_VEC2);
+    SetShaderValue(planeShader, planeLoc.forward,  &forward,          SHADER_UNIFORM_VEC2);
+    SetShaderValue(planeShader, planeLoc.left,     &left,             SHADER_UNIFORM_VEC2);
+    SetShaderValue(planeShader, planeLoc.projDist, &projDist,         SHADER_UNIFORM_FLOAT);
 
     // Re-read every frame rather than caching at load: the framebuffer is
     // resized when the window moves between monitors of different scale, and
@@ -681,76 +672,10 @@ static void DrawFloorGPU(float projDist, Vector2 forward, Vector2 left) {
     // window itself.  On a 1.0-scale monitor this is (1,1) and costs nothing.
     float fragScale[2] = {GetRenderWidth() / (float)WIDTH,
                           GetRenderHeight() / (float)HEIGHT};
-    SetShaderValue(floorShader, floorLoc.fragScale, fragScale, SHADER_UNIFORM_VEC2);
+    SetShaderValue(planeShader, planeLoc.fragScale, fragScale, SHADER_UNIFORM_VEC2);
 
-    Rectangle src  = {0, 0, (float)floorGpuTex.width, (float)floorGpuTex.height};
-    Rectangle dest = {0, (float)FLOOR_TOP, (float)WIDTH, (float)FLOOR_ROWS};
-    BeginShaderMode(floorShader);
-        DrawTexturePro(floorGpuTex, src, dest, (Vector2){0, 0}, 0.0f, WHITE);
-    EndShaderMode();
-}
-
-// The same projection stepped per row on the CPU.  Kept as a reference
-// implementation and for comparison against the shader.
-static void DrawFloorCPU(float projDist, Vector2 forward, Vector2 left) {
-    const float eyeHeight = EYE_HEIGHT;
-    const float mapW = COLS * (float)CELL_SIZE;
-    const float mapH = ROWS * (float)CELL_SIZE;
-
-    for (int row = 0; row < FLOOR_ROWS; row++) {
-        float dy = (FLOOR_TOP + row + 0.5f) - HEIGHT / 2.0f; // pixels below horizon
-        float rowDist = projDist * eyeHeight / dy;
-        Color *out = floorBuf + (size_t)row * WIDTH;
-
-        if (rowDist > (float)FAR_CLIP) {
-            memset(out, 0, WIDTH * sizeof *out); // past the clip plane: nothing
-            continue;
-        }
-        // Same fog curve as the walls, and constant for the row, so it costs one
-        // multiply per channel instead of a distance calculation per pixel.
-        float shade = 1.0f - rowDist / FOG_DIST;
-        if (shade < 0.0f) shade = 0.0f;
-        unsigned s = (unsigned)(shade * 256.0f);
-
-        // World position of the leftmost pixel plus a constant step: at fixed
-        // depth the floor point is affine in screen x, so the row is a straight
-        // walk across the texture.
-        float k      = rowDist / projDist;
-        float planeX = 0.5f - WIDTH / 2.0f;
-        float wx = gameState.player.x + forward.x * rowDist - left.x * planeX * k;
-        float wy = gameState.player.y + forward.y * rowDist - left.y * planeX * k;
-        float stepX = -left.x * k;
-        float stepY = -left.y * k;
-
-        for (size_t x = 0; x < WIDTH; x++, wx += stepX, wy += stepY) {
-            // Outside the map is empty space rather than floor -- the same
-            // convention castRay uses, so the two agree on where the dungeon
-            // ends.  Left transparent, so the background shows through.
-            if (wx < 0.0f || wx >= mapW || wy < 0.0f || wy >= mapH) {
-                out[x] = (Color){0, 0, 0, 0};
-                continue;
-            }
-            // Inside the map both coordinates are non-negative, so the
-            // truncating cast is a floor and the mask is a correct wrap.
-            int tx = (int)(wx * floorScaleX) & floorMaskX;
-            int ty = (int)(wy * floorScaleY) & floorMaskY;
-            Color t = floorTexels[ty * floorSrc.width + tx];
-            out[x] = (Color){(unsigned char)((t.r * s) >> 8),
-                             (unsigned char)((t.g * s) >> 8),
-                             (unsigned char)((t.b * s) >> 8), 255};
-        }
-    }
-    UpdateTexture(floorTex, floorBuf);
-    DrawTexture(floorTex, 0, FLOOR_TOP, WHITE);
-}
-
-// Draw the floor plane below the horizon.  Must run before the wall columns: a
-// wall's bottom edge lands exactly where the floor at that wall's distance would
-// be, so painting walls afterwards covers precisely the floor pixels the wall
-// occludes and no others.
-static void DrawFloor(float projDist, Vector2 forward, Vector2 left) {
-    if (floorMode == FLOOR_GPU) DrawFloorGPU(projDist, forward, left);
-    else                        DrawFloorCPU(projDist, forward, left);
+    DrawPlaneHalf(-1.0f, PLANE_TINT_CEILING, 0.0f, (float)CEILING_ROWS);
+    DrawPlaneHalf( 1.0f, PLANE_TINT_FLOOR, (float)HORIZON_Y, (float)FLOOR_ROWS);
 }
 
 // The top-down overlay: dungeon cells, then the player marker and the view
@@ -855,7 +780,7 @@ int main(int argc, char **argv)
     // floor.png is a lossless re-encode of the source floor.jpg: raylib is built
     // without SUPPORT_FILEFORMAT_JPG (it is off in its default config), so
     // LoadImage rejects the JPEG outright with "Data format not supported".
-    if (!InitFloor("./assets/floor.png", "./assets/floor.fs")) {
+    if (!InitPlanes("./assets/floor.png", "./assets/floor.fs")) {
         CloseWindow();
         return 1;
     }
@@ -883,12 +808,6 @@ int main(int argc, char **argv)
             if (IsKeyPressed(KEY_M)) {
               showMinimap = !showMinimap;
             }
-            if (IsKeyPressed(KEY_F) && IsShaderValid(floorShader)) {
-              floorMode = (floorMode == FLOOR_GPU) ? FLOOR_CPU : FLOOR_GPU;
-              printf("floor: %s\n", floorMode == FLOOR_GPU ? "GPU (shader)"
-                                                           : "CPU (per-pixel)");
-              fflush(stdout);
-            }
             // clamp angle to between 0 and 2PI
             if (gameState.cameraAngle < 0) {
               gameState.cameraAngle += (PI * 2);
@@ -903,7 +822,7 @@ int main(int argc, char **argv)
             Vector2 forward = (Vector2){cosf(gameState.cameraAngle), -sinf(gameState.cameraAngle)};
             // Screen-left direction (forward rotated a quarter turn)
             Vector2 left = (Vector2){-sinf(gameState.cameraAngle), -cosf(gameState.cameraAngle)};
-            DrawFloor(projDist, forward, left);
+            DrawPlanes(projDist, forward, left);
             for (size_t c = 0; c < CAST_STEPS; c++) {
                 // Sample the projection plane at uniform screen intervals, not at
                 // uniform angles: angle is not linear in screen x, so pairing uniform
@@ -954,7 +873,7 @@ int main(int argc, char **argv)
     }
 
     free(wallDepth);
-    UnloadFloor();
+    UnloadPlanes();
     CloseWindow();
 
     return 0;
